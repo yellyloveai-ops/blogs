@@ -85,8 +85,6 @@ The Evolve Me prompt template is parameterized — it injects the user's feedbac
 
 The `eval-agent-readiness-score` skill tells you where you stand. The `improve-agent-readiness-score` skill closes the gaps.
 
-> [▶ Try eval-agent-readiness-score](https://github.com/yellyloveai-ops/yellyrock?yellyrock_id=eval-agent-readiness-score)
-
 ---
 
 ## The Feedback History
