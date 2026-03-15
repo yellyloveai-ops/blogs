@@ -12,6 +12,65 @@ The fix took 30 seconds once someone looked at the logs: add `web_fetch` to the 
 
 This is the problem `autoRunUntilNoError()` solves.
 
+But there's a deeper issue the 2am failure exposes: the schedule was configured with too many permissions in the first place, and nobody thought to audit them. Auto-fixing permission errors is useful — but the more secure path is to get the privilege set right *before* the first run, and keep it minimal going forward.
+
+---
+
+## Security First: Interactive Privilege Analysis
+
+Before a schedule ever runs, yelly-time can now perform a **privilege dry-run** — a lightweight analysis pass that asks Claude Code to reason about what tools the prompt actually needs, without executing it.
+
+```bash
+POST /schedules/:id/analyze-privileges
+```
+
+The response is an interactive report:
+
+```json
+{
+  "prompt": "Summarize overnight GitHub activity and file issues",
+  "requiredTools": ["web_fetch", "bash"],
+  "optionalTools": ["computer"],
+  "reasoning": {
+    "web_fetch": "Needed to call GitHub REST API",
+    "bash":      "Needed to run gh CLI for issue creation",
+    "computer":  "Only needed if UI interaction is required — likely not"
+  },
+  "recommendation": "Start with [web_fetch, bash]. Add computer only if first run fails."
+}
+```
+
+The UI surfaces this before you save the schedule. You see exactly what permissions are being requested and why — so you can approve, trim, or question each one. This turns privilege configuration from a "set it and forget it" afterthought into a deliberate first step.
+
+**Why this matters more than auto-fix:**
+
+Auto-fix is reactive. It adds tools after a failure tells you they're needed. Privilege analysis is proactive — it reasons about the prompt's intent and recommends a minimal set before any code runs. You catch over-requests (like `computer` in a headless schedule) before they become an attack surface, not after.
+
+---
+
+## Least Privilege per Schedule
+
+Once the privilege analysis runs, yelly-time enforces a **per-schedule minimum privilege model**. Each schedule gets its own isolated `allowTools` list, starting from empty and built only from the analyzer's recommendation plus your explicit approvals.
+
+```yaml
+# ~/.yelly-time/schedules.yaml (generated)
+- id: github-digest
+  prompt: "Summarize overnight GitHub activity..."
+  allowTools:
+    - web_fetch   # approved: GitHub API calls
+    - bash        # approved: gh CLI issue creation
+  deniedTools:
+    - computer    # explicitly excluded: not needed for headless run
+  privilegeAnalyzedAt: "2026-03-15T01:00:00Z"
+  privilegeLockedAt:   "2026-03-15T01:02:33Z"   # set after user review
+```
+
+Once `privilegeLockedAt` is set, `autoRunUntilNoError()` behavior changes: instead of freely appending to `allowTools`, it **pauses and alerts** before adding any new tool. The auto-fix loop can still run, but any privilege expansion requires a fresh interactive review.
+
+This means a schedule can't silently accumulate permissions over time. If a prompt evolves and needs a new tool, you'll know — because the loop stops and shows you the privilege diff before proceeding.
+
+**The principle:** grant the minimum set that makes the schedule work, lock it, and treat any future expansion as a deliberate decision rather than a silent background change.
+
 ---
 
 ## The Pattern: Error Report → Auto-Fix → Retry
@@ -82,16 +141,22 @@ The design principle: **errors should be actionable at a glance.** The session l
 
 The loop is deliberately conservative. It only applies fixes it's certain about:
 
-**Auto-fixable:**
-- Missing tool in `allowTools` (the most common failure mode for scheduled Claude Code runs)
+**Auto-fixable (pre-lock):**
+- Missing tool in `allowTools` (the most common failure mode for new Claude Code schedules)
 - Shell permission blocked (common when a schedule needs to run a script)
 
-**Report-only (human required):**
+**Requires interactive privilege review (post-lock):**
+- Any new tool addition after `privilegeLockedAt` is set — the loop pauses, shows you the privilege diff, and waits for explicit approval before retrying
+- This is intentional: a locked schedule requesting a new permission is a signal worth reviewing, not silently granting
+
+**Report-only (human required regardless of lock state):**
 - Claude Code not installed — the server can't install software on your behalf
 - API rate limits — the fix is "wait," which the server can do, but the root cause is external
 - Unknown errors — anything that doesn't match a known pattern gets surfaced for human review
 
 The `maxRetries` default is 3. After three attempts with the same error, the loop stops and marks the schedule as failed. This prevents infinite loops on errors that auto-fix can't actually resolve.
+
+> **Security note:** If you skip the privilege analysis step and let auto-fix run freely, you get the original behavior — tools are appended on demand. But you also forgo the least-privilege guarantee. The recommendation is to always run the analyzer before the first scheduled execution.
 
 ---
 
@@ -144,6 +209,8 @@ The response tells you how many attempts it took and whether it succeeded:
 **Auto-fix should be conservative.** We considered auto-fixing rate limit errors by adding a retry delay. We didn't — because rate limits often signal a deeper problem (prompt too expensive, schedule too frequent) that deserves human attention. The loop fixes what it's certain about and surfaces everything else.
 
 **The fix persists.** When the loop adds a tool to `allowTools`, it writes to `~/.yelly-time/schedules.yaml`. The next scheduled run uses the updated config. You don't have to remember to update the schedule manually.
+
+**Privilege analysis changes the mental model.** Without it, you think of `allowTools` as a list you grow reactively. With it, you think of it as a security boundary you set intentionally. The difference shows up in audits: a schedule with `privilegeLockedAt` in its config tells you someone reviewed its permissions; one without doesn't.
 
 ---
 
